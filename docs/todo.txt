@@ -1,0 +1,3 @@
+limitar a quantidade de veículos por unidade
+permitir a entrada de novos veiculos por unidade apenas se houver vaga da unidade disponivel <- LPR
+Próximos passos: execute o checklist do .txt sec.2 no servidor PHP, depois nos avise para habilitar expo-notifications (npx expo install expo-notifications expo-device) se quiser push nativo com app fechado.

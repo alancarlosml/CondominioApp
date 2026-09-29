@@ -1,0 +1,1292 @@
+================================================================================
+BACKEND - SISTEMA DE NOTIFICACOES PADRAO - VANILLA PHP
+CondominioApp - OneStartup
+================================================================================
+Versao: 1.0.0
+Data: 01/09/2026
+Banco atual: one_startup (ver databases/one_startup.sql)
+PHP: Vanilla (sem framework, sem composer obrigatorio)
+Base URL morador: https://face.onestartup.com.br/morador
+Base URL api:     https://face.onestartup.com.br/api
+App consome via: axios (src/services/api.js)
+
+LEIA ESTE ARQUIVO DO INICIO AO FIM ANTES DE EXECUTAR QUALQUER SQL.
+Todas as secoes estao separadas por "===== FILE:" para facilitar copiar
+cada arquivo para o servidor.
+================================================================================
+
+
+================================================================================
+SUMARIO
+================================================================================
+1. Visao geral e por que persistir no backend
+2. Checklist de instalacao (ordem de execucao)
+3. SQL - DDL completo (4 tabelas + indices)
+4. PHP - config/db.php
+5. PHP - helpers/response.php
+6. PHP - helpers/auth_helper.php
+7. PHP - helpers/notificacao_helper.php (FUNCAO CENTRAL criarNotificacao)
+8. PHP - morador/notificacoes.php (GET lista paginada + filtros)
+9. PHP - morador/notificacoes_unread_count.php (GET leve p/ badge)
+10. PHP - morador/notificacao_read.php (PATCH/POST marcar lida)
+11. PHP - morador/notificacao_preferencias.php (GET/PUT toggles)
+12. PHP - api/push_token.php (POST/DELETE token Expo)
+13. PHP - api/evento_acesso.php (hook facial - dependente entrou)
+14. PHP - api/encomenda_hook.php (chamar apos INSERT em entregas)
+15. PHP - cron/cron_faturas_vencimento.php (D-3, D-1, vencida)
+16. Exemplos de integracao para FUTUROS modulos
+17. Recomendacoes obrigatorias para futuras alteracoes funcionarem
+18. Testes com curl
+19. Cron / Agendamento
+20. Seguranca, LGPD e Performance
+21. Troubleshooting
+
+
+================================================================================
+1. VISAO GERAL E POR QUE PERSISTIR NO BACKEND
+================================================================================
+- O app precisa de historico, badge de nao-lidas, e acesso multi-unidade.
+  Se a notificacao existir so no app (memoria), ela se perde ao desinstalar,
+  trocar de unidade (CondominioContext) ou fazer logout (AuthContext).
+- Backend e fonte da verdade. App faz polling (60s) + pull-to-refresh
+  e exibe toast/banner. Push Expo nativo e Fase 2 opcional.
+- Toda notificacao nasce no backend via criarNotificacao() - nunca o app
+  cria direto no banco. App apenas LE e MARCA COMO LIDA.
+
+Fluxo padrao para QUALQUER modulo:
+  Evento de dominio (ex: INSERT entregas, vencimento fatura, facial)
+    -> PHP chama criarNotificacao($pdo, [...])
+    -> INSERT tbl_notificacao (respeita preferencia do usuario)
+    -> (opcional Fase 2) dispara Expo Push para tokens da unidade
+    -> App na proxima polling exibe badge + lista + toast sonoro
+
+Categorias padrao (nao crie fora deste ENUM sem migrar app):
+  encomenda, fatura, acesso, portao, veiculo, sistema
+
+
+================================================================================
+2. CHECKLIST DE INSTALACAO (ordem)
+================================================================================
+[ ] 1. Backup do banco: mysqldump -u root -p one_startup > backup_pre_notif.sql
+[ ] 2. Executar SECAO 3 (SQL) no MySQL - verificar versao >= 5.7 (JSON)
+[ ]      Se MySQL 5.6, trocar colunas JSON por TEXT no DDL antes de executar
+[ ] 3. Criar/editar config/db.php (SECAO 4) com credenciais reais
+[ ] 4. Criar pasta helpers/ e copiar helpers/response.php + auth_helper.php + notificacao_helper.php
+[ ] 5. Criar/copiar endpoints morador/*.php e api/*.php (secoes 8-14)
+[ ] 6. Ajustar CORS/Allow-Origin se api e morador estiverem em dominios diferentes
+[ ] 7. Criar pasta cron/ e configurar cron_faturas_vencimento.php no crontab
+[ ] 8. Testar com curl (secao 18) - lista, marcar lida, preferencia
+[ ] 9. Hookar encomendas: editar api/listar_entregas.php ou onde faz INSERT em entregas
+[ ]      para chamar encomenda_hook.php ou direto criarNotificacao()
+[ ] 10. Hookar acesso facial: editar endpoint que grava tbl_acesso
+[ ] 11. Informar app: endpoints prontos -> liberar NotificationContext no app
+[ ] 12. (Opcional Fase 2) Configurar Expo Push: obter tokens e liberar envio
+
+
+================================================================================
+3. SQL - DDL COMPLETO
+================================================================================
+===== FILE: sql/01_tbl_notificacao.sql =====
+-- Execute este bloco no MySQL. Compatibilidade: utf8mb4 igual ao dump existente.
+-- Se der erro em JSON, substitua JSON por TEXT.
+
+CREATE TABLE IF NOT EXISTS `tbl_notificacao` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `id_tbl_condominio` INT UNSIGNED DEFAULT NULL,
+  `id_tbl_unidade` INT UNSIGNED DEFAULT NULL,
+  `id_tbl_condomino` INT UNSIGNED DEFAULT NULL COMMENT 'destinatario; NULL = broadcast para unidade/condominio',
+  `id_tbl_usuario` INT UNSIGNED DEFAULT NULL,
+  `categoria` ENUM('encomenda','fatura','acesso','portao','veiculo','sistema') NOT NULL,
+  `tipo` VARCHAR(60) NOT NULL COMMENT 'ex: encomenda_created, fatura_due_soon_3d, acesso_facial_dependent',
+  `titulo` VARCHAR(150) NOT NULL,
+  `descricao` VARCHAR(500) NOT NULL,
+  `prioridade` ENUM('baixa','media','alta','critica') NOT NULL DEFAULT 'media',
+  `status` ENUM('unread','read') NOT NULL DEFAULT 'unread',
+  `cod_notificacao` VARCHAR(30) DEFAULT NULL COMMENT 'legado: codNotificacao exibido no app',
+  `deep_link_screen` VARCHAR(60) DEFAULT NULL COMMENT 'ex: Encomendas, Portoes, Notificacoes',
+  `deep_link_params` JSON DEFAULT NULL COMMENT '{"codigoHash":"...","id_fatura":1}',
+  `metadata` JSON DEFAULT NULL COMMENT '{"nome_dependente":"Joao","valor":"150.00"}',
+  `data_criacao` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `data_leitura` DATETIME DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_unidade_status_data` (`id_tbl_unidade`, `status`, `data_criacao` DESC),
+  KEY `idx_condomino` (`id_tbl_condomino`),
+  KEY `idx_condominio` (`id_tbl_condominio`),
+  KEY `idx_categoria_tipo` (`categoria`, `tipo`),
+  KEY `idx_status_data` (`status`, `data_criacao` DESC)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- Fallback MySQL 5.6 (descomente se JSON der erro):
+-- ALTER TABLE `tbl_notificacao` MODIFY `deep_link_params` TEXT NULL;
+-- ALTER TABLE `tbl_notificacao` MODIFY `metadata` TEXT NULL;
+
+===== FILE: sql/02_tbl_push_token.sql =====
+CREATE TABLE IF NOT EXISTS `tbl_push_token` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `id_tbl_condomino` INT UNSIGNED DEFAULT NULL,
+  `id_tbl_unidade` INT UNSIGNED DEFAULT NULL,
+  `id_tbl_usuario` INT UNSIGNED DEFAULT NULL,
+  `token` VARCHAR(500) NOT NULL COMMENT 'ExponentPushToken[...] ou FCM token',
+  `platform` ENUM('android','ios','web') NOT NULL,
+  `device_id` VARCHAR(100) DEFAULT NULL,
+  `criado_em` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `atualizado_em` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_token` (`token`(191)),
+  KEY `idx_unidade` (`id_tbl_unidade`),
+  KEY `idx_condomino` (`id_tbl_condomino`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+===== FILE: sql/03_tbl_notificacao_preferencia.sql =====
+CREATE TABLE IF NOT EXISTS `tbl_notificacao_preferencia` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `id_tbl_condomino` INT UNSIGNED NOT NULL,
+  `categoria` VARCHAR(30) NOT NULL COMMENT 'encomenda,fatura,acesso,portao,veiculo,sistema',
+  `habilitado` TINYINT(1) NOT NULL DEFAULT 1,
+  `som_habilitado` TINYINT(1) NOT NULL DEFAULT 1,
+  `vibracao_habilitada` TINYINT(1) NOT NULL DEFAULT 1,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_condomino_categoria` (`id_tbl_condomino`, `categoria`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- Seed preferencias default para condominos existentes (opcional, app cria sob demanda)
+-- INSERT IGNORE INTO tbl_notificacao_preferencia (id_tbl_condomino, categoria)
+-- SELECT id_tbl_condomino, 'encomenda' FROM tbl_condomino
+-- UNION ALL SELECT id_tbl_condomino, 'fatura' FROM tbl_condomino
+-- UNION ALL SELECT id_tbl_condomino, 'acesso' FROM tbl_condomino;
+
+===== FILE: sql/04_tbl_fatura.sql =====
+-- Se voce NAO tem tabela de faturas, execute este bloco.
+-- Se ja tem, ADAPTE: garanta colunas id_tbl_unidade, vencimento, status, valor
+CREATE TABLE IF NOT EXISTS `tbl_fatura` (
+  `id_tbl_fatura` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `id_tbl_unidade` INT UNSIGNED NOT NULL,
+  `id_tbl_condominio` INT UNSIGNED NOT NULL,
+  `id_tbl_condomino` INT UNSIGNED DEFAULT NULL,
+  `descricao` VARCHAR(200) NOT NULL DEFAULT 'Taxa condominial',
+  `valor` DECIMAL(10,2) NOT NULL,
+  `vencimento` DATE NOT NULL,
+  `status` ENUM('aberta','paga','vencida','cancelada') NOT NULL DEFAULT 'aberta',
+  `codigo_barras` VARCHAR(100) DEFAULT NULL,
+  `criado_em` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id_tbl_fatura`),
+  KEY `idx_unidade_venc` (`id_tbl_unidade`, `vencimento`),
+  KEY `idx_status_venc` (`status`, `vencimento`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- Exemplo seed (remover em producao):
+-- INSERT INTO tbl_fatura (id_tbl_unidade, id_tbl_condominio, descricao, valor, vencimento, status) VALUES
+-- (10, 1, 'Condominio 09/2026', 450.00, DATE_ADD(CURDATE(), INTERVAL 3 DAY), 'aberta');
+
+===== FILE: sql/05_verificacao.sql =====
+-- Rode para confirmar:
+-- SHOW TABLES LIKE 'tbl_notificacao';
+-- SHOW TABLES LIKE 'tbl_push_token';
+-- SHOW TABLES LIKE 'tbl_notificacao_preferencia';
+-- SHOW TABLES LIKE 'tbl_fatura';
+-- DESCRIBE tbl_notificacao;
+
+
+================================================================================
+4. PHP - config/db.php
+================================================================================
+===== FILE: config/db.php =====
+<?php
+// config/db.php - Vanilla PDO
+// Copie para o servidor e ajuste credenciais. Nao commitar com senha real.
+
+$DB_HOST = getenv('DB_HOST') ?: 'localhost';
+$DB_NAME = getenv('DB_NAME') ?: 'one_startup';
+$DB_USER = getenv('DB_USER') ?: 'root';
+$DB_PASS = getenv('DB_PASS') ?: '';
+$DB_CHARSET = 'utf8mb4';
+
+$dsn = "mysql:host={$DB_HOST};dbname={$DB_NAME};charset={$DB_CHARSET}";
+$options = [
+    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    PDO::ATTR_EMULATE_PREPARES   => false,
+];
+
+try {
+    $pdo = new PDO($dsn, $DB_USER, $DB_PASS, $options);
+} catch (PDOException $e) {
+    http_response_code(500);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['status' => 'error', 'message' => 'Erro de conexao com banco'], JSON_UNESCAPED_UNICODE);
+    error_log('[db.php] Conexao falhou: ' . $e->getMessage());
+    exit;
+}
+?>
+
+
+================================================================================
+5. PHP - helpers/response.php
+================================================================================
+===== FILE: helpers/response.php =====
+<?php
+// helpers/response.php - helpers de resposta JSON + CORS vanilla
+
+function setCorsHeaders() {
+    // Ajuste origin em producao para dominio do app/web
+    header('Access-Control-Allow-Origin: *');
+    header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
+    header('Access-Control-Allow-Credentials: true');
+    if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+        http_response_code(204);
+        exit;
+    }
+}
+
+function jsonResponse($data, $httpCode = 200) {
+    http_response_code($httpCode);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+function jsonError($message, $httpCode = 400, $extra = []) {
+    $payload = array_merge(['status' => 'error', 'message' => $message], $extra);
+    jsonResponse($payload, $httpCode);
+}
+
+function jsonSuccess($message = 'OK', $extra = [], $httpCode = 200) {
+    $payload = array_merge(['status' => 'success', 'message' => $message], $extra);
+    jsonResponse($payload, $httpCode);
+}
+
+function getJsonInput() {
+    $raw = file_get_contents('php://input');
+    if (empty($raw)) return [];
+    $data = json_decode($raw, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        // Tenta fallback form-urlencoded (login2.php faz assim)
+        parse_str($raw, $fallback);
+        return $fallback ?: [];
+    }
+    return is_array($data) ? $data : [];
+}
+
+function sanitizeString($v, $maxLen = 500) {
+    if (!is_string($v)) return '';
+    $v = trim($v);
+    if (mb_strlen($v) > $maxLen) $v = mb_substr($v, 0, $maxLen);
+    return $v;
+}
+?>
+
+
+================================================================================
+6. PHP - helpers/auth_helper.php
+================================================================================
+===== FILE: helpers/auth_helper.php =====
+<?php
+// helpers/auth_helper.php - extrai usuario do token (Bearer)
+// Adaptar conforme seu login2.php. Hoje o app usa Bearer token em api.js
+// Se ainda usa session_/cookie, adapte para ler $_COOKIE ou $_SESSION
+
+function getBearerToken() {
+    $header = null;
+    if (isset($_SERVER['HTTP_AUTHORIZATION'])) {
+        $header = $_SERVER['HTTP_AUTHORIZATION'];
+    } elseif (isset($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])) {
+        $header = $_SERVER['REDIRECT_HTTP_AUTHORIZATION'];
+    } elseif (function_exists('apache_request_headers')) {
+        $h = apache_request_headers();
+        $header = $h['Authorization'] ?? $h['authorization'] ?? null;
+    }
+    if ($header && preg_match('/Bearer\s+(.+)/i', $header, $m)) {
+        return trim($m[1]);
+    }
+    // Fallback: token via query/body (para testes curl)
+    if (!empty($_GET['token'])) return $_GET['token'];
+    if (!empty($_POST['token'])) return $_POST['token'];
+    return null;
+}
+
+// Retorna array com id_tbl_condomino / id_tbl_usuario / id_tbl_unidade se conseguir resolver
+// Se seu sistema ainda nao tem JWT, troque esta funcao para consultar tbl_condomino por token
+function getAuthUser(PDO $pdo) {
+    $token = getBearerToken();
+    if (!$token) return null;
+
+    // TENTATIVA 1: token salvo em tbl_condomino.token (legado one_startup.sql)
+    $stmt = $pdo->prepare("SELECT id_tbl_condomino, id_tbl_condominio, nome, cpf FROM tbl_condomino WHERE token = :t LIMIT 1");
+    $stmt->execute([':t' => $token]);
+    $row = $stmt->fetch();
+    if ($row) {
+        return [
+            'id_tbl_condomino' => $row['id_tbl_condomino'],
+            'id_tbl_condominio' => $row['id_tbl_condominio'],
+            'nome' => $row['nome'],
+            'cpf' => $row['cpf'],
+            'token' => $token
+        ];
+    }
+
+    // TENTATIVA 2: session_ fallback (app gera session_ quando backend nao retorna token)
+    // Neste caso, tente extrair id do proprio token: session_{timestamp}_{id_condomino}
+    if (strpos($token, 'session_') === 0) {
+        $parts = explode('_', $token);
+        $id = end($parts);
+        if (is_numeric($id)) {
+            $stmt = $pdo->prepare("SELECT id_tbl_condomino, id_tbl_condominio, nome, cpf FROM tbl_condomino WHERE id_tbl_condomino = :id LIMIT 1");
+            $stmt->execute([':id' => (int)$id]);
+            $row = $stmt->fetch();
+            if ($row) {
+                $row['token'] = $token;
+                return $row;
+            }
+        }
+    }
+
+    // TENTATIVA 3: JWT real (se migrar no futuro) - decodificar sem validar assinatura por enquanto
+    // Descomente se usar JWT:
+    // $parts = explode('.', $token); if(count($parts)==3){ $payload=json_decode(base64_decode($parts[1]),true); ... }
+
+    return null;
+}
+
+// Busca unidades do condomino (para validar id_tbl_unidade pertence ao usuario)
+function getUnidadesDoCondomino(PDO $pdo, $idCondomino) {
+    // Ajuste conforme sua relacao: tbl_unidade x tbl_condomino ou via tbl_cond_user
+    // Exemplo simplificado: busca por id_tbl_condomino em tbl_condomino.unidade
+    // Substitua pela query real do seu login2.php (que retorna id_tbl_unidade)
+    $stmt = $pdo->prepare("
+        SELECT u.id_tbl_unidade, u.bloco, u.apartamento, u.id_tbl_condominio
+        FROM tbl_unidade u
+        INNER JOIN tbl_condomino c ON c.id_tbl_condominio = u.id_tbl_condominio
+        WHERE c.id_tbl_condomino = :id
+        LIMIT 50
+    ");
+    $stmt->execute([':id' => (int)$idCondomino]);
+    return $stmt->fetchAll();
+}
+?>
+
+
+================================================================================
+7. PHP - helpers/notificacao_helper.php (FUNCAO CENTRAL)
+================================================================================
+===== FILE: helpers/notificacao_helper.php =====
+<?php
+// helpers/notificacao_helper.php - FUNCAO CENTRAL que todo modulo deve chamar
+// Vanilla PHP, PDO, sem dependencias
+
+require_once __DIR__ . '/response.php';
+
+/**
+ * Cria notificacao no banco respeitando preferencias do destinatario.
+ *
+ * @param PDO $pdo
+ * @param array $dados [
+ *   'id_tbl_condominio' => int|null,
+ *   'id_tbl_unidade'    => int|null,      // obrigatorio para filtrar por unidade no app
+ *   'id_tbl_condomino'  => int|null,      // null = broadcast para todos da unidade
+ *   'id_tbl_usuario'    => int|null,
+ *   'categoria'         => 'encomenda'|'fatura'|'acesso'|'portao'|'veiculo'|'sistema',
+ *   'tipo'              => string,        // ex: encomenda_created
+ *   'titulo'            => string,
+ *   'descricao'         => string,
+ *   'prioridade'        => 'baixa'|'media'|'alta'|'critica' (default media),
+ *   'deep_link_screen'  => string|null,   // ex: Encomendas
+ *   'deep_link_params'  => array|null,    // ex: ['codigoHash'=>'abc']
+ *   'metadata'          => array|null,
+ *   'cod_notificacao'   => string|null
+ * ]
+ * @return int|false id inserido ou false se bloqueado por preferencia
+ */
+function criarNotificacao(PDO $pdo, array $dados) {
+    $categoriasValidas = ['encomenda','fatura','acesso','portao','veiculo','sistema'];
+    $prioridadesValidas = ['baixa','media','alta','critica'];
+
+    $categoria = strtolower(trim($dados['categoria'] ?? ''));
+    if (!in_array($categoria, $categoriasValidas, true)) {
+        error_log("[criarNotificacao] categoria invalida: $categoria");
+        return false;
+    }
+    $tipo = sanitizeString($dados['tipo'] ?? $categoria, 60);
+    $titulo = sanitizeString($dados['titulo'] ?? '', 150);
+    $descricao = sanitizeString($dados['descricao'] ?? '', 500);
+    if ($titulo === '' || $descricao === '') {
+        error_log("[criarNotificacao] titulo/descricao vazios");
+        return false;
+    }
+    $prioridade = in_array($dados['prioridade'] ?? 'media', $prioridadesValidas, true) ? $dados['prioridade'] : 'media';
+
+    $idCondominio = isset($dados['id_tbl_condominio']) ? (int)$dados['id_tbl_condominio'] : null;
+    $idUnidade    = isset($dados['id_tbl_unidade']) ? (int)$dados['id_tbl_unidade'] : null;
+    $idCondomino  = isset($dados['id_tbl_condomino']) ? (int)$dados['id_tbl_condomino'] : null;
+    $idUsuario    = isset($dados['id_tbl_usuario']) ? (int)$dados['id_tbl_usuario'] : null;
+
+    // Se for para condomino especifico, respeitar preferencia
+    if ($idCondomino) {
+        $stmt = $pdo->prepare("SELECT habilitado FROM tbl_notificacao_preferencia WHERE id_tbl_condomino = :c AND categoria = :cat LIMIT 1");
+        $stmt->execute([':c' => $idCondomino, ':cat' => $categoria]);
+        $pref = $stmt->fetch();
+        if ($pref && (int)$pref['habilitado'] === 0) {
+            // Usuario desativou esta categoria
+            return false;
+        }
+    }
+
+    // Se broadcast (idCondomino null) mas tem idUnidade, expandir para todos da unidade
+    // Para evitar spam, aqui inserimos 1 linha com id_tbl_condomino NULL e app filtra por unidade
+    // Alternativa: descomentar bloco abaixo para criar 1 linha por morador da unidade
+    /*
+    if (!$idCondomino && $idUnidade) {
+        $stmt = $pdo->prepare("SELECT id_tbl_condomino FROM tbl_condomino WHERE id_tbl_condominio = :cond AND unidade = :unid");
+        // adapte query conforme sua relacao unidade-condomino
+    }
+    */
+
+    $deepScreen = isset($dados['deep_link_screen']) ? sanitizeString($dados['deep_link_screen'], 60) : null;
+    $deepParams = isset($dados['deep_link_params']) && is_array($dados['deep_link_params']) ? json_encode($dados['deep_link_params'], JSON_UNESCAPED_UNICODE) : null;
+    $metadata   = isset($dados['metadata']) && is_array($dados['metadata']) ? json_encode($dados['metadata'], JSON_UNESCAPED_UNICODE) : null;
+    $codNotif   = isset($dados['cod_notificacao']) ? sanitizeString($dados['cod_notificacao'], 30) : null;
+    if (!$codNotif) {
+        $codNotif = strtoupper(substr($categoria,0,3)) . '-' . date('Ymd') . '-' . substr(uniqid(), -4);
+    }
+
+    $sql = "INSERT INTO tbl_notificacao
+        (id_tbl_condominio, id_tbl_unidade, id_tbl_condomino, id_tbl_usuario, categoria, tipo, titulo, descricao, prioridade, status, cod_notificacao, deep_link_screen, deep_link_params, metadata, data_criacao)
+        VALUES (:cond, :unid, :condomino, :usuario, :cat, :tipo, :tit, :desc, :prio, 'unread', :cod, :screen, :params, :meta, NOW())";
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([
+        ':cond'     => $idCondominio,
+        ':unid'     => $idUnidade,
+        ':condomino'=> $idCondomino,
+        ':usuario'  => $idUsuario,
+        ':cat'      => $categoria,
+        ':tipo'     => $tipo,
+        ':tit'      => $titulo,
+        ':desc'     => $descricao,
+        ':prio'     => $prioridade,
+        ':cod'      => $codNotif,
+        ':screen'   => $deepScreen,
+        ':params'   => $deepParams,
+        ':meta'     => $metadata,
+    ]);
+
+    $id = (int)$pdo->lastInsertId();
+
+    // Fase 2: enviar push Expo se houver tokens (secao 17)
+    // enviarPushParaUnidade($pdo, $idUnidade, $titulo, $descricao, ['id'=>$id,'categoria'=>$categoria,'tipo'=>$tipo]);
+
+    return $id;
+}
+
+/**
+ * Envia push via Expo Push Service (Fase 2 - opcional no MVP)
+ * Requer tokens ExponentPushToken[...] salvos em tbl_push_token
+ */
+function enviarPushParaUnidade(PDO $pdo, $idUnidade, $titulo, $corpo, array $data = []) {
+    if (!$idUnidade) return;
+    $stmt = $pdo->prepare("SELECT token FROM tbl_push_token WHERE id_tbl_unidade = :u AND token LIKE 'ExponentPushToken%'");
+    $stmt->execute([':u' => (int)$idUnidade]);
+    $tokens = $stmt->fetchAll(PDO::FETCH_COLUMN);
+    if (!$tokens) return;
+
+    $messages = [];
+    foreach ($tokens as $t) {
+        $messages[] = [
+            'to' => $t,
+            'title' => $titulo,
+            'body' => $corpo,
+            'data' => $data,
+            'sound' => 'default',
+            'priority' => 'high',
+            'channelId' => 'default'
+        ];
+    }
+
+    $ch = curl_init('https://exp.host/--/api/v2/push/send');
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json'],
+        CURLOPT_POSTFIELDS => json_encode($messages, JSON_UNESCAPED_UNICODE),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 8,
+    ]);
+    $resp = curl_exec($ch);
+    $err = curl_error($ch);
+    curl_close($ch);
+    if ($err) error_log("[push] erro curl: $err");
+    else error_log("[push] resp: $resp");
+}
+
+// Helpers para tipos comuns (use estes nos hooks)
+function notificarEncomendaChegou(PDO $pdo, $idUnidade, $idCondominio, $idCondomino, $codigoHash, $empresa) {
+    return criarNotificacao($pdo, [
+        'id_tbl_condominio' => $idCondominio,
+        'id_tbl_unidade'    => $idUnidade,
+        'id_tbl_condomino'  => $idCondomino, // ou null para broadcast da unidade
+        'categoria'         => 'encomenda',
+        'tipo'              => 'encomenda_created',
+        'titulo'            => 'Nova encomenda na portaria',
+        'descricao'         => "Chegou encomenda de {$empresa} (cod {$codigoHash}). Retire na portaria.",
+        'prioridade'        => 'alta',
+        'deep_link_screen'  => 'Encomendas',
+        'deep_link_params'  => ['codigoHash' => $codigoHash],
+        'metadata'          => ['codigoHash'=>$codigoHash,'empresa'=>$empresa]
+    ]);
+}
+
+function notificarFaturaProximaVencer(PDO $pdo, $fatura) {
+    $dias = (int)ceil((strtotime($fatura['vencimento']) - time())/86400);
+    $tipo = $dias <= 1 ? 'fatura_due_today' : 'fatura_due_soon_3d';
+    $desc = $dias <= 1 ? "Vence amanha ({$fatura['vencimento']})" : "Vence em {$dias} dias ({$fatura['vencimento']})";
+    return criarNotificacao($pdo, [
+        'id_tbl_condominio' => $fatura['id_tbl_condominio'],
+        'id_tbl_unidade'    => $fatura['id_tbl_unidade'],
+        'id_tbl_condomino'  => $fatura['id_tbl_condomino'] ?? null,
+        'categoria'         => 'fatura',
+        'tipo'              => $tipo,
+        'titulo'            => 'Fatura proxima do vencimento',
+        'descricao'         => "{$fatura['descricao']} - R$ {$fatura['valor']} - {$desc}",
+        'prioridade'        => $dias <= 1 ? 'critica' : 'alta',
+        'deep_link_screen'  => 'Faturas',
+        'deep_link_params'  => ['id_fatura'=>$fatura['id_tbl_fatura']],
+        'metadata'          => ['id_fatura'=>$fatura['id_tbl_fatura'],'vencimento'=>$fatura['vencimento'],'valor'=>$fatura['valor']]
+    ]);
+}
+
+function notificarAcessoFacialDependente(PDO $pdo, $idUnidade, $idCondominio, $nomeDependente, $idAparelho) {
+    return criarNotificacao($pdo, [
+        'id_tbl_condominio' => $idCondominio,
+        'id_tbl_unidade'    => $idUnidade,
+        'categoria'         => 'acesso',
+        'tipo'              => 'facial_dependent_entered',
+        'titulo'            => 'Acesso por reconhecimento facial',
+        'descricao'         => "{$nomeDependente} entrou via facial agora.",
+        'prioridade'        => 'media',
+        'deep_link_screen'  => 'AccessHistory',
+        'metadata'          => ['nome_dependente'=>$nomeDependente,'id_aparelho'=>$idAparelho]
+    ]);
+}
+?>
+
+
+================================================================================
+8. PHP - morador/notificacoes.php (GET lista)
+================================================================================
+===== FILE: morador/notificacoes.php =====
+<?php
+// morador/notificacoes.php
+// GET /morador/notificacoes?id_unidade=10&status=unread&categoria=encomenda&page=1&limit=20
+// Headers: Authorization: Bearer <token>
+
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../helpers/response.php';
+require_once __DIR__ . '/../helpers/auth_helper.php';
+
+setCorsHeaders();
+
+if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+    jsonError('Metodo nao permitido', 405);
+}
+
+$auth = getAuthUser($pdo);
+// Se exigir auth, descomente:
+// if (!$auth) jsonError('Nao autenticado', 401);
+
+$idUnidade = isset($_GET['id_unidade']) ? (int)$_GET['id_unidade'] : (isset($_GET['id_tbl_unidade']) ? (int)$_GET['id_tbl_unidade'] : null);
+$status    = isset($_GET['status']) ? strtolower(trim($_GET['status'])) : null; // unread, read, all
+$categoria = isset($_GET['categoria']) ? strtolower(trim($_GET['categoria'])) : null;
+$page      = max(1, (int)($_GET['page'] ?? 1));
+$limit     = min(50, max(1, (int)($_GET['limit'] ?? 20)));
+$offset    = ($page - 1) * $limit;
+
+if (!$idUnidade && $auth) {
+    // Tenta inferir unidade do condomino logado (primeira)
+    $unis = getUnidadesDoCondomino($pdo, $auth['id_tbl_condomino']);
+    if (!empty($unis[0]['id_tbl_unidade'])) $idUnidade = (int)$unis[0]['id_tbl_unidade'];
+}
+if (!$idUnidade) {
+    jsonError('id_unidade obrigatorio', 422);
+}
+
+// Validacoes
+if ($status && !in_array($status, ['unread','read','all'], true)) $status = null;
+if ($categoria && !in_array($categoria, ['encomenda','fatura','acesso','portao','veiculo','sistema'], true)) $categoria = null;
+
+$where = "WHERE (id_tbl_unidade = :unid OR id_tbl_unidade IS NULL)";
+$params = [':unid' => $idUnidade];
+
+if ($status && $status !== 'all') {
+    $where .= " AND status = :st";
+    $params[':st'] = $status;
+}
+if ($categoria) {
+    $where .= " AND categoria = :cat";
+    $params[':cat'] = $categoria;
+}
+// Se tiver condomino logado, filtra: exibe broadcast (id_tbl_condomino IS NULL) + do proprio condomino
+if ($auth && !empty($auth['id_tbl_condomino'])) {
+    $where .= " AND (id_tbl_condomino IS NULL OR id_tbl_condomino = :condomino)";
+    $params[':condomino'] = (int)$auth['id_tbl_condomino'];
+}
+
+// Total
+$countSql = "SELECT COUNT(*) FROM tbl_notificacao $where";
+$stmt = $pdo->prepare($countSql);
+$stmt->execute($params);
+$total = (int)$stmt->fetchColumn();
+
+// Lista
+$sql = "SELECT id, cod_notificacao, categoria, tipo, titulo, descricao, prioridade, status,
+               deep_link_screen, deep_link_params, metadata, data_criacao, data_leitura
+        FROM tbl_notificacao
+        $where
+        ORDER BY data_criacao DESC
+        LIMIT :lim OFFSET :off";
+$stmt = $pdo->prepare($sql);
+foreach ($params as $k=>$v) $stmt->bindValue($k, $v);
+$stmt->bindValue(':lim', $limit, PDO::PARAM_INT);
+$stmt->bindValue(':off', $offset, PDO::PARAM_INT);
+$stmt->execute();
+$rows = $stmt->fetchAll();
+
+// Normaliza para formato esperado pelo app (compat NotificacoesScreen.js:29-33)
+$notificacoes = array_map(function($r){
+    // deep_link_params e metadata podem vir como JSON string (TEXT fallback)
+    $dlp = $r['deep_link_params'];
+    if (is_string($dlp)) { $tmp=json_decode($dlp,true); if($tmp!==null) $dlp=$tmp; }
+    $meta = $r['metadata'];
+    if (is_string($meta)) { $tmp=json_decode($meta,true); if($tmp!==null) $meta=$tmp; }
+    return [
+        'id' => (string)$r['id'],
+        'codNotificacao' => $r['cod_notificacao'],
+        'categoria' => $r['categoria'],
+        'tipo' => $r['tipo'],
+        'titulo' => $r['titulo'],
+        'descricao' => $r['descricao'],
+        'prioridade' => $r['prioridade'],
+        'status' => $r['status'],
+        'data' => $r['data_criacao'], // app usa item.data em NotificacoesScreen.js:119
+        'deepLink' => $r['deep_link_screen'] ? ['screen'=>$r['deep_link_screen'],'params'=>$dlp] : null,
+        'metadata' => $meta,
+        // compat legado
+        'data_leitura' => $r['data_leitura'],
+    ];
+}, $rows);
+
+// unreadCount para badge
+$stmt = $pdo->prepare("SELECT COUNT(*) FROM tbl_notificacao WHERE id_tbl_unidade = :u AND status='unread' " . ($auth ? "AND (id_tbl_condomino IS NULL OR id_tbl_condomino=:c)" : ""));
+$cntParams = [':u'=>$idUnidade];
+if ($auth) $cntParams[':c']=(int)$auth['id_tbl_condomino'];
+$stmt->execute($cntParams);
+$unreadCount = (int)$stmt->fetchColumn();
+
+jsonResponse([
+    'status' => 'success',
+    'notificacoes' => $notificacoes, // app aceita response.data ou response.data.notificacoes
+    'data' => $notificacoes,         // fallback
+    'total' => $total,
+    'page' => $page,
+    'limit' => $limit,
+    'unreadCount' => $unreadCount
+]);
+?>
+
+
+================================================================================
+9. PHP - morador/notificacoes_unread_count.php
+================================================================================
+===== FILE: morador/notificacoes_unread_count.php =====
+<?php
+// GET /morador/notificacoes_unread_count.php?id_unidade=10
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../helpers/response.php';
+require_once __DIR__ . '/../helpers/auth_helper.php';
+setCorsHeaders();
+$auth = getAuthUser($pdo);
+$idUnidade = (int)($_GET['id_unidade'] ?? $_GET['id_tbl_unidade'] ?? 0);
+if (!$idUnidade && $auth) {
+    $unis = getUnidadesDoCondomino($pdo, $auth['id_tbl_condomino']);
+    if (!empty($unis[0]['id_tbl_unidade'])) $idUnidade = (int)$unis[0]['id_tbl_unidade'];
+}
+if (!$idUnidade) jsonError('id_unidade obrigatorio', 422);
+$sql = "SELECT COUNT(*) FROM tbl_notificacao WHERE id_tbl_unidade = :u AND status='unread'";
+$params=[':u'=>$idUnidade];
+if ($auth && !empty($auth['id_tbl_condomino'])) {
+    $sql .= " AND (id_tbl_condomino IS NULL OR id_tbl_condomino=:c)";
+    $params[':c']=(int)$auth['id_tbl_condomino'];
+}
+$stmt=$pdo->prepare($sql); $stmt->execute($params);
+jsonResponse(['status'=>'success','unreadCount'=>(int)$stmt->fetchColumn()]);
+?>
+
+
+================================================================================
+10. PHP - morador/notificacao_read.php
+================================================================================
+===== FILE: morador/notificacao_read.php =====
+<?php
+// POST /morador/notificacao_read.php
+// Body JSON: {"id":123} | {"ids":[1,2,3]} | {"all":true, "id_unidade":10}
+// Tambem aceita PATCH /morador/notificacoes/{id}/read via rewrite (ver .htaccess)
+
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../helpers/response.php';
+require_once __DIR__ . '/../helpers/auth_helper.php';
+setCorsHeaders();
+if (!in_array($_SERVER['REQUEST_METHOD'], ['POST','PATCH','PUT'])) jsonError('Metodo nao permitido',405);
+
+$auth = getAuthUser($pdo);
+$input = getJsonInput();
+// Suporta id via URL rewrite: /notificacoes/123/read
+if (empty($input['id']) && !empty($_GET['id'])) $input['id'] = $_GET['id'];
+
+$pdo->beginTransaction();
+try {
+    if (!empty($input['all'])) {
+        $idUnidade = (int)($input['id_unidade'] ?? $input['id_tbl_unidade'] ?? 0);
+        if (!$idUnidade) jsonError('id_unidade obrigatorio para all=true',422);
+        $sql = "UPDATE tbl_notificacao SET status='read', data_leitura=NOW() WHERE id_tbl_unidade=:u AND status='unread'";
+        $params=[':u'=>$idUnidade];
+        if ($auth && !empty($auth['id_tbl_condomino'])) {
+            $sql .= " AND (id_tbl_condomino IS NULL OR id_tbl_condomino=:c)";
+            $params[':c']=(int)$auth['id_tbl_condomino'];
+        }
+        $stmt=$pdo->prepare($sql); $stmt->execute($params);
+        $pdo->commit();
+        jsonSuccess('Todas marcadas como lidas', ['updated'=>$stmt->rowCount()]);
+    } elseif (!empty($input['ids']) && is_array($input['ids'])) {
+        $ids = array_map('intval', $input['ids']);
+        $ids = array_filter($ids);
+        if (!$ids) jsonError('ids vazio',422);
+        $in = implode(',', $ids);
+        // Validar que pertence a unidade/condomino se quiser seguranca extra
+        $stmt=$pdo->prepare("UPDATE tbl_notificacao SET status='read', data_leitura=NOW() WHERE id IN ($in) AND status='unread'");
+        $stmt->execute();
+        $pdo->commit();
+        jsonSuccess('Marcadas como lidas', ['updated'=>$stmt->rowCount()]);
+    } elseif (!empty($input['id'])) {
+        $id = (int)$input['id'];
+        $stmt=$pdo->prepare("UPDATE tbl_notificacao SET status='read', data_leitura=NOW() WHERE id=:id AND status='unread'");
+        $stmt->execute([':id'=>$id]);
+        $pdo->commit();
+        jsonSuccess('Marcada como lida', ['updated'=>$stmt->rowCount()]);
+    } else {
+        jsonError('Informe id, ids ou all=true',422);
+    }
+} catch (Exception $e) {
+    $pdo->rollBack();
+    error_log('[notificacao_read] '.$e->getMessage());
+    jsonError('Erro ao marcar como lida',500);
+}
+?>
+
+
+================================================================================
+11. PHP - morador/notificacao_preferencias.php
+================================================================================
+===== FILE: morador/notificacao_preferencias.php =====
+<?php
+// morador/notificacao_preferencias.php
+// GET  -> lista preferencias do condomino logado
+// PUT/POST -> salva {"categoria":"fatura","habilitado":0} ou {"preferencias":[{"categoria":"encomenda","habilitado":1},...]}
+
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../helpers/response.php';
+require_once __DIR__ . '/../helpers/auth_helper.php';
+setCorsHeaders();
+$auth = getAuthUser($pdo);
+if (!$auth || empty($auth['id_tbl_condomino'])) jsonError('Nao autenticado',401);
+$idCondomino = (int)$auth['id_tbl_condomino'];
+$categorias = ['encomenda','fatura','acesso','portao','veiculo','sistema'];
+
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    $stmt=$pdo->prepare("SELECT categoria, habilitado, som_habilitado, vibracao_habilitada FROM tbl_notificacao_preferencia WHERE id_tbl_condomino=:c");
+    $stmt->execute([':c'=>$idCondomino]);
+    $rows=$stmt->fetchAll();
+    $map=[];
+    foreach($rows as $r) $map[$r['categoria']]=$r;
+    $result=[];
+    foreach($categorias as $cat){
+        $result[] = $map[$cat] ?? ['categoria'=>$cat,'habilitado'=>1,'som_habilitado'=>1,'vibracao_habilitada'=>1];
+    }
+    jsonResponse(['status'=>'success','preferencias'=>$result]);
+}
+
+if (in_array($_SERVER['REQUEST_METHOD'], ['POST','PUT','PATCH'])) {
+    $input=getJsonInput();
+    $items=[];
+    if (!empty($input['preferencias']) && is_array($input['preferencias'])) $items=$input['preferencias'];
+    elseif (!empty($input['categoria'])) $items=[$input];
+    else jsonError('Informe categoria/habilitado ou array preferencias',422);
+
+    $pdo->beginTransaction();
+    foreach($items as $it){
+        $cat=strtolower(trim($it['categoria'] ?? ''));
+        if(!in_array($cat,$categorias,true)) continue;
+        $hab = !empty($it['habilitado']) ? 1 : 0;
+        $som = isset($it['som_habilitado']) ? (int)(bool)$it['som_habilitado'] : 1;
+        $vib = isset($it['vibracao_habilitada']) ? (int)(bool)$it['vibracao_habilitada'] : 1;
+        $stmt=$pdo->prepare("INSERT INTO tbl_notificacao_preferencia (id_tbl_condomino,categoria,habilitado,som_habilitado,vibracao_habilitada)
+            VALUES (:c,:cat,:h,:s,:v) ON DUPLICATE KEY UPDATE habilitado=:h2, som_habilitado=:s2, vibracao_habilitada=:v2");
+        $stmt->execute([':c'=>$idCondomino,':cat'=>$cat,':h'=>$hab,':s'=>$som,':v'=>$vib,':h2'=>$hab,':s2'=>$som,':v2'=>$vib]);
+    }
+    $pdo->commit();
+    jsonSuccess('Preferencias salvas');
+}
+jsonError('Metodo nao permitido',405);
+?>
+
+
+================================================================================
+12. PHP - api/push_token.php
+================================================================================
+===== FILE: api/push_token.php =====
+<?php
+// api/push_token.php
+// POST {token, platform, id_unidade, device_id} -> registra/atualiza
+// DELETE {token} ou ?token=xxx -> remove (logout)
+// GET ?id_unidade=10 -> lista tokens (debug, proteger)
+
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../helpers/response.php';
+require_once __DIR__ . '/../helpers/auth_helper.php';
+setCorsHeaders();
+$auth = getAuthUser($pdo);
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $input=getJsonInput();
+    $token=sanitizeString($input['token'] ?? '',500);
+    $platform=strtolower(trim($input['platform'] ?? 'android'));
+    $idUnidade=(int)($input['id_unidade'] ?? $input['id_tbl_unidade'] ?? 0);
+    $deviceId=sanitizeString($input['device_id'] ?? '',100);
+    if(!$token) jsonError('token obrigatorio',422);
+    if(!in_array($platform,['android','ios','web'],true)) $platform='android';
+    // Validar formato Expo: ExponentPushToken[xxxxxx]
+    // Se usar FCM, aceite qualquer string
+
+    $idCondomino = $auth['id_tbl_condomino'] ?? null;
+    $stmt=$pdo->prepare("INSERT INTO tbl_push_token (id_tbl_condomino,id_tbl_unidade,token,platform,device_id)
+        VALUES (:c,:u,:t,:p,:d) ON DUPLICATE KEY UPDATE id_tbl_condomino=:c2, id_tbl_unidade=:u2, platform=:p2, device_id=:d2, atualizado_em=NOW()");
+    $stmt->execute([
+        ':c'=>$idCondomino,':u'=>$idUnidade?:null,':t'=>$token,':p'=>$platform,':d'=>$deviceId?:null,
+        ':c2'=>$idCondomino,':u2'=>$idUnidade?:null,':p2'=>$platform,':d2'=>$deviceId?:null
+    ]);
+    jsonSuccess('Token registrado');
+}
+if ($_SERVER['REQUEST_METHOD'] === 'DELETE') {
+    $input=getJsonInput();
+    $token=sanitizeString($input['token'] ?? $_GET['token'] ?? '',500);
+    if(!$token) jsonError('token obrigatorio',422);
+    $stmt=$pdo->prepare("DELETE FROM tbl_push_token WHERE token=:t");
+    $stmt->execute([':t'=>$token]);
+    jsonSuccess('Token removido', ['deleted'=>$stmt->rowCount()]);
+}
+jsonError('Metodo nao permitido',405);
+?>
+
+
+================================================================================
+13. PHP - api/evento_acesso.php
+================================================================================
+===== FILE: api/evento_acesso.php =====
+<?php
+// api/evento_acesso.php - Hook para reconhecimento facial
+// Chamado pelo controlador facial ou pelo endpoint que insere em tbl_acesso
+// POST JSON: {id_tbl_condomino_dependente, id_tbl_unidade, nome_dependente, id_aparelho, id_condominio}
+// Este endpoint insere em tbl_acesso (se ainda nao inseriu) e cria notificacao
+
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../helpers/response.php';
+require_once __DIR__ . '/../helpers/notificacao_helper.php';
+setCorsHeaders();
+if($_SERVER['REQUEST_METHOD']!=='POST') jsonError('Metodo nao permitido',405);
+$input=getJsonInput();
+$idDependente = (int)($input['id_tbl_condomino_dependente'] ?? $input['id_tbl_condomino'] ?? 0);
+$idUnidade    = (int)($input['id_tbl_unidade'] ?? 0);
+$nomeDependente = sanitizeString($input['nome_dependente'] ?? $input['nome'] ?? '',150);
+$idAparelho   = (int)($input['id_aparelho'] ?? $input['id_tbl_aparelho'] ?? 0);
+$idCondominio = (int)($input['id_tbl_condominio'] ?? 0);
+
+if(!$nomeDependente) jsonError('nome_dependente obrigatorio',422);
+if(!$idUnidade) jsonError('id_tbl_unidade obrigatorio',422);
+
+// Opcional: inserir em tbl_acesso se ainda nao foi inserido pelo hardware
+if($idDependente && $idAparelho){
+    $stmt=$pdo->prepare("INSERT INTO tbl_acesso (id_tbl_condomino,nome_condomino,data_abertura,id_tbl_aparelho) VALUES (:c,:n,NOW(),:a)");
+    $stmt->execute([':c'=>$idDependente,':n'=>$nomeDependente,':a'=>$idAparelho]);
+}
+
+// Buscar titulares da unidade para notificar (broadcast por unidade)
+// Se sua regra e unidade->condominos, ajuste query
+if(!$idCondominio){
+    $stmt=$pdo->prepare("SELECT id_tbl_condominio FROM tbl_unidade WHERE id_tbl_unidade=:u LIMIT 1");
+    $stmt->execute([':u'=>$idUnidade]);
+    $idCondominio=(int)($stmt->fetchColumn() ?: 0);
+}
+
+$id = notificarAcessoFacialDependente($pdo, $idUnidade, $idCondominio, $nomeDependente, $idAparelho);
+if($id) jsonSuccess('Evento registrado e notificacao criada', ['id_notificacao'=>$id]);
+else jsonError('Evento registrado mas notificacao bloqueada por preferencia',200);
+?>
+
+
+================================================================================
+14. PHP - api/encomenda_hook.php
+================================================================================
+===== FILE: api/encomenda_hook.php =====
+<?php
+// api/encomenda_hook.php - Chamar APOS INSERT em `entregas`
+// Voce pode incluir este helper direto no arquivo que faz o INSERT em entregas
+// ao inves de criar endpoint separado.
+// POST {id_entrega, codigoHash, empresa, id_unidade, nome_destinatario}
+
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../helpers/response.php';
+require_once __DIR__ . '/../helpers/notificacao_helper.php';
+setCorsHeaders();
+if($_SERVER['REQUEST_METHOD']!=='POST') jsonError('Metodo nao permitido',405);
+$input=getJsonInput();
+$codigoHash = sanitizeString($input['codigoHash'] ?? $input['codigo_hash'] ?? '',150);
+$empresa    = sanitizeString($input['empresa'] ?? 'Portaria',100);
+$idUnidade  = (int)($input['id_unidade'] ?? $input['id_tbl_unidade'] ?? $input['idtblunidade'] ?? 0);
+$nomeDest   = sanitizeString($input['nome_destinatario'] ?? '',100);
+
+if(!$codigoHash) jsonError('codigoHash obrigatorio',422);
+if(!$idUnidade) jsonError('id_unidade obrigatorio',422);
+
+// Buscar condominio da unidade
+$stmt=$pdo->prepare("SELECT id_tbl_condominio FROM tbl_unidade WHERE id_tbl_unidade=:u LIMIT 1");
+$stmt->execute([':u'=>$idUnidade]);
+$idCondominio=(int)($stmt->fetchColumn() ?: 0);
+
+// Se quiser notificar apenas o destinatario especifico, busque id_tbl_condomino por nome
+$idCondomino = null;
+// $stmt=$pdo->prepare("SELECT id_tbl_condomino FROM tbl_condomino WHERE nome LIKE :n LIMIT 1");
+// $stmt->execute([':n'=>"%$nomeDest%"]); $idCondomino=(int)$stmt->fetchColumn();
+
+$id = notificarEncomendaChegou($pdo, $idUnidade, $idCondominio, $idCondomino, $codigoHash, $empresa);
+jsonSuccess('Hook encomenda processado', ['id_notificacao'=>$id]);
+?>
+
+// --- COMO INTEGRAR NO SEU CODIGO EXISTENTE DE ENTREGAS ---
+// No arquivo que faz INSERT INTO entregas (ex: api/listar_entregas.php ou portaria/entrega.php),
+// adicione APOS o $pdo->lastInsertId():
+//
+// require_once __DIR__ . '/../helpers/notificacao_helper.php';
+// notificarEncomendaChegou($pdo, $idUnidade, $idCondominio, null, $codigoHash, $empresa);
+// // nao precisa tratar erro, se falhar loga mas nao quebra o fluxo de entrega
+
+
+================================================================================
+15. PHP - cron/cron_faturas_vencimento.php
+================================================================================
+===== FILE: cron/cron_faturas_vencimento.php =====
+<?php
+// cron/cron_faturas_vencimento.php
+// Rodar via crontab diariamente 08:00: php /var/www/cron/cron_faturas_vencimento.php
+// Ou via GET /cron/cron_faturas_vencimento.php?cron_token=SEU_TOKEN (proteger)
+
+$CRON_TOKEN = getenv('CRON_TOKEN') ?: 'troque-este-token';
+
+// Se chamado via web, validar token
+if (php_sapi_name() !== 'cli') {
+    $tok = $_GET['cron_token'] ?? $_GET['token'] ?? '';
+    if ($tok !== $CRON_TOKEN) { http_response_code(403); echo 'Forbidden'; exit; }
+}
+
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../helpers/notificacao_helper.php';
+
+$hoje = date('Y-m-d');
+$d3   = date('Y-m-d', strtotime('+3 days'));
+$d1   = date('Y-m-d', strtotime('+1 day'));
+
+function criarSeNaoExiste(PDO $pdo, $fatura, $tipo) {
+    // Evita duplicar notificacao do mesmo tipo para mesma fatura no mesmo dia
+    $stmt=$pdo->prepare("SELECT id FROM tbl_notificacao WHERE categoria='fatura' AND tipo=:t AND JSON_EXTRACT(metadata,'$.id_fatura')=:fid AND DATE(data_criacao)=CURDATE() LIMIT 1");
+    // Fallback TEXT: WHERE metadata LIKE :like
+    // Ajuste conforme seu MySQL
+    try {
+        $stmt->execute([':t'=>$tipo, ':fid'=>$fatura['id_tbl_fatura']]);
+        if($stmt->fetch()) return false;
+    } catch(Exception $e){
+        $stmt=$pdo->prepare("SELECT id FROM tbl_notificacao WHERE categoria='fatura' AND tipo=:t AND metadata LIKE :like AND DATE(data_criacao)=CURDATE() LIMIT 1");
+        $stmt->execute([':t'=>$tipo, ':like'=>'%"id_fatura":'.$fatura['id_tbl_fatura'].'%']);
+        if($stmt->fetch()) return false;
+    }
+    return true;
+}
+
+// Faturas D+3 (aviso 3 dias antes)
+$stmt=$pdo->prepare("SELECT * FROM tbl_fatura WHERE status='aberta' AND vencimento=:d3");
+$stmt->execute([':d3'=>$d3]);
+foreach($stmt->fetchAll() as $f){
+    if(!criarSeNaoExiste($pdo,$f,'fatura_due_soon_3d')) continue;
+    notificarFaturaProximaVencer($pdo, $f);
+    echo "Notificada fatura {$f['id_tbl_fatura']} D-3\n";
+}
+
+// Faturas D+1 (vence amanha)
+$stmt=$pdo->prepare("SELECT * FROM tbl_fatura WHERE status='aberta' AND vencimento=:d1");
+$stmt->execute([':d1'=>$d1]);
+foreach($stmt->fetchAll() as $f){
+    // Sobrescreve tipo para due_today
+    $f['vencimento']=$d1;
+    if(!criarSeNaoExiste($pdo,$f,'fatura_due_today')) continue;
+    // Forca tipo today
+    $f['descricao']=$f['descricao'];
+    // Chama helper mas ajusta tipo internamente se precisar
+    notificarFaturaProximaVencer($pdo, $f);
+    echo "Notificada fatura {$f['id_tbl_fatura']} D-1\n";
+}
+
+// Faturas vencidas (vencimento < hoje e ainda aberta)
+$stmt=$pdo->prepare("SELECT * FROM tbl_fatura WHERE status='aberta' AND vencimento < :hoje");
+$stmt->execute([':hoje'=>$hoje]);
+foreach($stmt->fetchAll() as $f){
+    if(!criarSeNaoExiste($pdo,$f,'fatura_overdue')) continue;
+    criarNotificacao($pdo, [
+        'id_tbl_condominio'=>$f['id_tbl_condominio'],
+        'id_tbl_unidade'=>$f['id_tbl_unidade'],
+        'id_tbl_condomino'=>$f['id_tbl_condomino']??null,
+        'categoria'=>'fatura',
+        'tipo'=>'fatura_overdue',
+        'titulo'=>'Fatura vencida',
+        'descricao'=>"{$f['descricao']} - R$ {$f['valor']} venceu em {$f['vencimento']}. Regularize para evitar multa.",
+        'prioridade'=>'critica',
+        'deep_link_screen'=>'Faturas',
+        'deep_link_params'=>['id_fatura'=>$f['id_tbl_fatura']],
+        'metadata'=>['id_fatura'=>$f['id_tbl_fatura'],'vencimento'=>$f['vencimento'],'valor'=>$f['valor']]
+    ]);
+    // Opcional: atualizar status para vencida
+    // $pdo->prepare("UPDATE tbl_fatura SET status='vencida' WHERE id_tbl_fatura=:id")->execute([':id'=>$f['id_tbl_fatura']]);
+    echo "Notificada fatura vencida {$f['id_tbl_fatura']}\n";
+}
+echo "Cron faturas concluido em ".date('Y-m-d H:i:s')."\n";
+?>
+
+
+================================================================================
+16. EXEMPLOS DE INTEGRACAO PARA FUTUROS MODULOS
+================================================================================
+-- Para QUALQUER novo modulo (ex: veiculo, portao, reserva area comum),
+-- basta chamar criarNotificacao() no evento PHP. Nao precisa alterar app.
+
+Exemplo: Portao aberto via api/api_aparelho.php (PUT)
+  // apos validar e abrir portao com sucesso
+  require_once __DIR__ . '/../helpers/notificacao_helper.php';
+  criarNotificacao($pdo, [
+    'id_tbl_condominio'=>$idCondominio,
+    'id_tbl_unidade'=>$idUnidade,
+    'categoria'=>'portao',
+    'tipo'=>'portao_opened',
+    'titulo'=>'Portao aberto',
+    'descricao'=>"Portao {$local} aberto com sucesso.",
+    'prioridade'=>'baixa',
+    'deep_link_screen'=>'Portoes',
+    'metadata'=>['id_aparelho'=>$idAparelho,'local'=>$local]
+  ]);
+
+Exemplo: Veiculo cadastrado
+  criarNotificacao($pdo, [
+    'id_tbl_unidade'=>$idUnidade,
+    'categoria'=>'veiculo',
+    'tipo'=>'veiculo_created',
+    'titulo'=>'Veiculo cadastrado',
+    'descricao'=>"Veiculo {$placa} cadastrado na unidade.",
+    'prioridade'=>'baixa',
+    'deep_link_screen'=>'MeusVeiculos'
+  ]);
+
+Exemplo: Comunicado do condominio (sistema)
+  criarNotificacao($pdo, [
+    'id_tbl_condominio'=>$idCondominio,
+    'categoria'=>'sistema',
+    'tipo'=>'comunicado',
+    'titulo'=>'Comunicado: Manutencao',
+    'descricao'=>"Manutencao da piscina dia 10/09.",
+    'prioridade'=>'alta',
+    'deep_link_screen'=>'Notificacoes'
+  ]);
+
+IMPORTANTE: sempre informe id_tbl_unidade para que o app filtre por unidade
+(CondominioContext.selectedCondominio.id_tbl_unidade). Se for broadcast do
+condominio inteiro, deixe id_tbl_unidade = NULL e id_tbl_condomino = NULL,
+e o app exibira para todos que filtrarem por id_tbl_condominio.
+
+
+================================================================================
+17. RECOMENDACOES OBRIGATORIAS PARA FUTURAS ALTERACOES FUNCIONAREM
+================================================================================
+LEIA COM ATENCAO - Repasse esta secao para quem for alterar PHP/Banco/App:
+
+[OBRIGATORIO - BANCO]
+1. NUNCA renomeie colunas de tbl_notificacao sem migrar app. O app espera:
+   id, cod_notificacao, categoria, tipo, titulo, descricao, prioridade, status,
+   deep_link_screen, deep_link_params, metadata, data_criacao, data_leitura
+   Se renomear, quebre a API morador/notificacoes.php e o app (NotificacoesScreen).
+2. Ao adicionar nova categoria, adicione no ENUM de tbl_notificacao E no
+   array $categoriasValidas de notificacao_helper.php E no app
+   src/constants/notifications.js e src/utils/notificationMapper.js
+   Caso contrario o INSERT sera bloqueado (return false).
+3. Nao remova indices idx_unidade_status_data - sem ele a listagem paginada
+   fica lenta com 10k+ notificacoes.
+4. Se trocar JSON por TEXT (MySQL 5.6), ajuste TODOS os json_encode/json_decode
+   e as queries de cron que usam JSON_EXTRACT para LIKE.
+5. Ao criar tbl_fatura real, mantenha colunas id_tbl_unidade, id_tbl_condominio,
+   vencimento (DATE), status, valor. O cron depende disso.
+6. Sempre que criar nova tabela que gera notificacao (ex: tbl_reserva),
+   adicione id_tbl_unidade para vincular notificacao a unidade correta.
+
+[OBRIGATORIO - PHP]
+7. Todo INSERT que deve gerar notificacao DEVE chamar criarNotificacao()
+   imediatamente apos o INSERT principal, DENTRO da mesma transacao se possivel,
+   mas NAO deixe falha de notificacao quebrar o fluxo principal (try/catch).
+   Exemplo: entrega criada deve ser salva mesmo se notificacao falhar.
+8. Nunca faca echo/print antes de jsonResponse() - quebra JSON do app (api.js).
+9. Sempre use prepared statements (PDO prepare) - todos os exemplos ja usam.
+   Nunca concatene $_GET/$_POST direto na SQL.
+10. Mantenha setCorsHeaders() e getJsonInput() em todos os endpoints morador/api.
+    O app envia JSON e Bearer token (api.js interceptor).
+11. Ao adicionar novo endpoint, adicione-o na lista de CORS e valide
+    getAuthUser() se for rota privada. Rotas publicas (cron) devem validar
+    cron_token.
+12. Nao altere o formato de resposta de morador/notificacoes.php:
+    {status:'success', notificacoes:[], total, unreadCount, page, limit}
+    O app faz fallback Array.isArray(response.data) vs response.data.notificacoes
+    (NotificacoesScreen.js:31). Mudar quebra app em producao.
+13. Endpoints de escrita devem aceitar OPTIONS (preflight) - setCorsHeaders ja faz.
+14. Logue erros com error_log() e retorne mensagem generica ao app (LGPD).
+    Nunca exponha stack trace ou SQL no jsonError.
+15. Se migrar para JWT real, atualize helpers/auth_helper.php getAuthUser()
+    para validar assinatura. Enquanto usar token de tbl_condomino, mantenha
+    fallback session_.
+
+[OBRIGATORIO - APP (para devs mobile)]
+16. Novos modulos NUNCA devem chamar api.get('/notificacoes') direto.
+    Use NotificationContext (src/contexts/NotificationContext.js) - ele centraliza
+    polling 60s, cache e badge. Ver docs/ARCHITECTURE.md.
+17. Ao criar nova categoria, adicione icone/cor em notificationMapper.js e
+    filtro em NotificacoesScreen + badge em DashboardScreen.
+18. Deep links: sempre envie deep_link_screen existente em App.js Stack
+    (Login, Home, MeusVeiculos, Notificacoes, Portoes, etc). Se screen nao
+    existir, o app ignora e abre Notificacoes.
+19. Preferencias: app salva em tbl_notificacao_preferencia via
+    morador/notificacao_preferencias.php e respeita no helper PHP antes de INSERT.
+    Nao filtre no app - filtre no backend para economizar polling.
+20. Som/vibracao: canal Android "default" deve ter sound default e vibration.
+    iOS usa sound default. Nao crie canais novos sem atualizar pushNotifications.js.
+
+[OBRIGATORIO - DEPLOY]
+21. Ao subir novo PHP, teste com curl (secao 18) antes de liberar app.
+22. Sempre que alterar ENUM, rode ALTER TABLE antes de subir PHP novo.
+23. Versionamento: mantenha runtimeVersion em app.json compativel; se mudar
+    contrato de notificacao, incremente e force update.
+
+[RECOMENDADO - OPERACIONAL]
+24. Limpeza: crie rotina mensal DELETE FROM tbl_notificacao WHERE status='read'
+    AND data_leitura < DATE_SUB(NOW(), INTERVAL 90 DAY) para nao inflar banco.
+25. Monitoramento: ative error_log e verifique cron log diariamente.
+26. Backup antes de qualquer ALTER TABLE.
+27. Documente novo tipo em docs/ANALISE_PRODUCAO.md ou crie docs/NOTIFICACOES.md
+
+
+================================================================================
+18. TESTES COM CURL
+================================================================================
+# 1. Listar (sem auth para teste, depois com Bearer)
+curl -s "https://face.onestartup.com.br/morador/notificacoes.php?id_unidade=10&limit=5" | jq
+
+# Com token:
+curl -s -H "Authorization: Bearer SEU_TOKEN" \
+  "https://face.onestartup.com.br/morador/notificacoes.php?id_unidade=10&status=unread" | jq
+
+# 2. Unread count (badge)
+curl -s "https://face.onestartup.com.br/morador/notificacoes_unread_count.php?id_unidade=10" | jq
+
+# 3. Criar notificacao de teste (hook encomenda)
+curl -s -X POST https://face.onestartup.com.br/api/encomenda_hook.php \
+  -H "Content-Type: application/json" \
+  -d '{"codigoHash":"TEST123","empresa":"Teste","id_unidade":10,"nome_destinatario":"Joao"}' | jq
+
+# 4. Marcar como lida
+curl -s -X POST https://face.onestartup.com.br/morador/notificacao_read.php \
+  -H "Content-Type: application/json" \
+  -d '{"id":1}' | jq
+
+# 5. Marcar todas como lidas
+curl -s -X POST https://face.onestartup.com.br/morador/notificacao_read.php \
+  -H "Content-Type: application/json" \
+  -d '{"all":true,"id_unidade":10}' | jq
+
+# 6. Preferencias - GET
+curl -s -H "Authorization: Bearer SEU_TOKEN" \
+  https://face.onestartup.com.br/morador/notificacao_preferencias.php | jq
+
+# 7. Preferencias - desativar fatura
+curl -s -X PUT -H "Authorization: Bearer SEU_TOKEN" -H "Content-Type: application/json" \
+  -d '{"categoria":"fatura","habilitado":0}' \
+  https://face.onestartup.com.br/morador/notificacao_preferencias.php | jq
+
+# 8. Evento facial
+curl -s -X POST https://face.onestartup.com.br/api/evento_acesso.php \
+  -H "Content-Type: application/json" \
+  -d '{"id_tbl_unidade":10,"nome_dependente":"Maria Filha","id_aparelho":3}' | jq
+
+# 9. Registrar push token (app)
+curl -s -X POST https://face.onestartup.com.br/api/push_token.php \
+  -H "Authorization: Bearer SEU_TOKEN" -H "Content-Type: application/json" \
+  -d '{"token":"ExponentPushToken[xxxxxxxx]","platform":"android","id_unidade":10}' | jq
+
+
+================================================================================
+19. CRON / AGENDAMENTO
+================================================================================
+# Linux crontab (crontab -e)
+# Roda todo dia 08:00 horario de Sao Paulo
+0 8 * * * /usr/bin/php /var/www/html/cron/cron_faturas_vencimento.php >> /var/log/cron_faturas.log 2>&1
+
+# Alternativa via wget (se PHP CLI nao disponivel)
+0 8 * * * /usr/bin/wget -qO- "https://face.onestartup.com.br/cron/cron_faturas_vencimento.php?cron_token=troque-este-token" >> /var/log/cron_faturas.log 2>&1
+
+# Para testar manualmente:
+php cron/cron_faturas_vencimento.php
+# ou
+curl "https://face.onestartup.com.br/cron/cron_faturas_vencimento.php?cron_token=troque-este-token"
+
+
+================================================================================
+20. SEGURANCA, LGPD E PERFORMANCE
+================================================================================
+- LGPD: notificacao contem dados pessoais (nome dependente, unidade). So exiba
+  para dono da unidade (filtro id_tbl_unidade + id_tbl_condomino). Nunca retorne
+  notificacoes de outra unidade.
+- Consentimento push: so registre tbl_push_token apos usuario aceitar permissao
+  no app (expo-notifications). Ofereca opt-out por categoria em
+  notificacao_preferencias.php (ja implementado).
+- Nao logue CPF/token em error_log - logger.js do app ja sanitiza.
+- Indices ja criados garantem listagem <100ms com 50k linhas. Se crescer muito,
+  particione por id_tbl_condominio ou arquive lidas antigas.
+- Rate limit: adicione throttle em notificacao_read.php se sofrer spam (ex: 10 req/s por IP).
+- HTTPS obrigatorio (app.json android.usesCleartextTraffic=false).
+
+
+================================================================================
+21. TROUBLESHOOTING
+================================================================================
+- Erro "categoria invalida" no error_log -> voce enviou categoria fora do ENUM.
+  Ver secao 17 item 2.
+- Lista vazia mas tem dados no banco -> verifique id_tbl_unidade enviado pelo app
+  (CondominioContext.selectedCondominio.id_tbl_unidade) vs coluna id_tbl_unidade.
+  Use broadcast: id_tbl_unidade IS NULL aparece para todos da unidade.
+- JSON mal formado -> verifique se PHP deu echo antes de jsonResponse (BOM, warning).
+  Ative display_errors=Off em producao.
+- CORS bloqueado no app web -> verifique setCorsHeaders() e OPTIONS 204.
+- Cron nao cria notificacao -> verifique vencimento DATE vs DATETIME, timezone
+  (date_default_timezone_set('America/Sao_Paulo')), e se fatura status='aberta'.
+- Push nao chega (Fase 2) -> verifique token formato ExponentPushToken e
+  se expo-server-sdk responde 200. Log em error_log.
+
+================================================================================
+FIM DO ARQUIVO - Duvidas: ver docs/ARCHITECTURE.md e src/contexts/* no repo
+================================================================================

@@ -30,8 +30,21 @@ yarn-error.*
 .DS_Store
 *.pem
 
-# local env files
-.env*.local
+# local environment and diagnostic files
+.env*
+!.env.example
+.tmp-*
+
+# agent tools / local worktrees
+.kilo/
+.claude/
+
+# logs and IDE
+*.log
+.idea/
+
+# database dumps (never commit real data)
+*.sql
 
 # typescript
 *.tsbuildinfo

@@ -1,0 +1,49 @@
+---
+description: Padrões React Native e Expo para o CondominioApp
+globs: "**/*.{js,jsx,ts,tsx}"
+alwaysApply: false
+---
+
+# Padrões React Native
+
+## Estilos
+
+- Use `StyleSheet.create()` em vez de objetos inline.
+- Cores e espaçamentos: importe de `@/constants/theme`.
+
+```javascript
+// ✅ BOM
+import { StyleSheet } from 'react-native';
+import { theme } from '@/constants/theme';
+
+const styles = StyleSheet.create({
+  box: {
+    padding: theme.spacing.md,
+    backgroundColor: theme.colors.card,
+    borderRadius: theme.borderRadius.md,
+  },
+});
+
+// ❌ EVITAR
+<View style={{ padding: 16, backgroundColor: '#fff' }} />
+```
+
+## Listas
+
+- Sempre use `keyExtractor` com id estável (nunca índice).
+
+```javascript
+// ✅ BOM
+keyExtractor={(item) => item.id}
+
+// ❌ EVITAR
+keyExtractor={(item, index) => index.toString()}
+```
+
+## Plataforma
+
+- Use `Platform.select()` ou arquivos `.ios.js` / `.android.js` quando o comportamento for diferente.
+
+## Dados sensíveis
+
+- Não armazenar tokens/senhas em AsyncStorage em produção; usar SecureStore (expo-secure-store) quando disponível.

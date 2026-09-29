@@ -1,0 +1,29 @@
+---
+description: Estrutura de pastas e convenções do CondominioApp
+alwaysApply: true
+---
+
+# Arquitetura e convenções
+
+## Imports
+
+- Use o alias `@/` para tudo que está em `src/`:
+  - `@/constants/theme`
+  - `@/contexts/AuthContext`
+  - `@/services/api`
+  - `@/screens/NomeScreen`
+  - `@/utils/storage`
+
+## Onde colocar cada coisa
+
+| Tipo | Pasta |
+|------|--------|
+| Telas | `src/screens/` |
+| Componentes reutilizáveis | `src/components/` (ui em `components/ui/`) |
+| Autenticação/Estado global | `src/contexts/` |
+| Chamadas API, haptics, notificações | `src/services/` |
+| Hooks reutilizáveis | `src/hooks/` |
+| Tema, cores, espaçamentos | `src/constants/` |
+| Storage, permissões, erro | `src/utils/` |
+
+Detalhes em `docs/ARCHITECTURE.md`.
